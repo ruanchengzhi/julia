@@ -335,8 +335,11 @@ x = SHermitianCompact{1,Float32,3}([1.0f0, 2.0f0, 3.0f0])
 ## A possibly relevant point is that the invalidated instance comes from
 ##    convert(::Type{T}, x) where {T>:Nothing} = convert(nonnothingtype_checked(T), x)
 ## and that >: is relatively unusual among method signatures.
+mi1 = instance(convert, (Type{Nothing}, String))
+w1 = worlds(mi1)
+mi2 = instance(Base.structdiff, (NamedTuple{(:by,),_A} where _A<:Tuple, Type{NamedTuple{(:by, :rev),T} where T<:Tuple}))
+w2 = worlds(mi2)
 abstract type Colorant end
-mi = instance(convert, (Type{Nothing}, String))
-w = worlds(mi)
 Base.convert(::Type{C}, c) where C<:Colorant = false
-@test_broken worlds(mi) == w
+@test_broken worlds(mi1) == w1
+@test_broken worlds(mi2) == w2
