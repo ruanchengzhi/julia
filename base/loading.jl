@@ -302,6 +302,16 @@ end
 const project_names = ("JuliaProject.toml", "Project.toml")
 const manifest_names = ("JuliaManifest.toml", "Manifest.toml")
 
+# Thread safety
+const TOML_CACHE = Dict{String, Dict{String, Any}}()
+
+function parsed_toml(project_file::String)
+    get!(TOML_CACHE, project_file) do
+        p = TOML.Parser(read(project_file, String); filepath=project_file)
+        d = TOML.parse(p)
+    end
+end
+
 # classify the LOAD_PATH entry to be one of:
 #  - `false`: nonexistant / nothing to see here
 #  - `true`: `env` is an implicit environment
@@ -367,88 +377,35 @@ function manifest_uuid_path(env::String, pkg::PkgId)::Union{Nothing,String}
     return nothing
 end
 
-# regular expressions for scanning project & manifest files
-
-const re_section            = r"^\s*\["
-const re_array_of_tables    = r"^\s*\[\s*\["
-const re_section_deps       = r"^\s*\[\s*\"?deps\"?\s*\]\s*(?:#|$)"
-const re_section_capture    = r"^\s*\[\s*\[\s*\"?(\w+)\"?\s*\]\s*\]\s*(?:#|$)"
-const re_subsection_deps    = r"^\s*\[\s*\"?(\w+)\"?\s*\.\s*\"?deps\"?\s*\]\s*(?:#|$)"
-const re_key_to_string      = r"^\s*(\w+)\s*=\s*\"(.*)\"\s*(?:#|$)"
-const re_uuid_to_string     = r"^\s*uuid\s*=\s*\"(.*)\"\s*(?:#|$)"
-const re_name_to_string     = r"^\s*name\s*=\s*\"(.*)\"\s*(?:#|$)"
-const re_path_to_string     = r"^\s*path\s*=\s*\"(.*)\"\s*(?:#|$)"
-const re_hash_to_string     = r"^\s*git-tree-sha1\s*=\s*\"(.*)\"\s*(?:#|$)"
-const re_manifest_to_string = r"^\s*manifest\s*=\s*\"(.*)\"\s*(?:#|$)"
-const re_deps_to_any        = r"^\s*deps\s*=\s*(.*?)\s*(?:#|$)"
-
 # find project file's top-level UUID entry (or nothing)
 function project_file_name_uuid(project_file::String, name::String)::PkgId
-    pkg = open(project_file) do io
-        uuid = dummy_uuid(project_file)
-        for line in eachline(io)
-            occursin(re_section, line) && break
-            if (m = match(re_name_to_string, line)) !== nothing
-                name = String(m.captures[1])
-            elseif (m = match(re_uuid_to_string, line)) !== nothing
-                uuid = UUID(m.captures[1])
-            end
-        end
-        return PkgId(uuid, name)
-    end
-    return pkg
+    uuid = dummy_uuid(project_file)
+    d = parsed_toml(project_file)
+    uuid = get(d, "uuid", uuid)
+    name = get(d, "name", name)
+    return PkgId(UUID(uuid), name)
 end
 
 function project_file_path(project_file::String, name::String)::String
-    path = open(project_file) do io
-        for line in eachline(io)
-            occursin(re_section, line) && break
-            if (m = match(re_path_to_string, line)) !== nothing
-                return String(m.captures[1])
-            end
-        end
-        return ""
-    end
-    return joinpath(dirname(project_file), path)
+    d = parsed_toml(project_file)
+    return get(d, "uuid", "")
 end
 
 
 # find project file's corresponding manifest file
 function project_file_manifest_path(project_file::String)::Union{Nothing,String}
-    open(project_file) do io
-        dir = abspath(dirname(project_file))
-        for line in eachline(io)
-            occursin(re_section, line) && break
-            if (m = match(re_manifest_to_string, line)) !== nothing
-                manifest_file = normpath(joinpath(dir, m.captures[1]))
-                isfile_casesensitive(manifest_file) && return manifest_file
-                return nothing # silently stop if the explicitly listed manifest file is not present
-            end
-        end
-        for mfst in manifest_names
-            manifest_file = joinpath(dir, mfst)
-            isfile_casesensitive(manifest_file) && return manifest_file
-        end
-        return nothing
+    dir = abspath(dirname(project_file))
+    d = parsed_toml(project_file)
+    explicit_manifest = get(d, "manifest", nothing)
+    if explicit_manifest !== nothing
+        manifest_file = normpath(joinpath(dir, explicit_manifest))
+        isfile_casesensitive(manifest_file) && return manifest_file
     end
-end
-
-# find `name` in a manifest file and return its UUID
-# return `nothing` on failure
-function manifest_file_name_uuid(manifest_file::IO, name::String)::Union{Nothing,UUID}
-    name_section = false
-    uuid = nothing
-    for line in eachline(manifest_file)
-        if (m = match(re_section_capture, line)) !== nothing
-            name_section && break
-            name_section = (m.captures[1] == name)
-        elseif name_section
-            if (m = match(re_uuid_to_string, line)) !== nothing
-                uuid = UUID(m.captures[1])
-            end
-        end
+    for mfst in manifest_names
+        manifest_file = joinpath(dir, mfst)
+        isfile_casesensitive(manifest_file) && return manifest_file
     end
-    return uuid
+    return nothing
 end
 
 # given a directory (implicit env from LOAD_PATH) and a name,
@@ -491,29 +448,17 @@ end
 # find project file root or deps `name => uuid` mapping
 # return `nothing` if `name` is not found
 function explicit_project_deps_get(project_file::String, name::String)::Union{Nothing,UUID}
-    pkg_uuid = open(project_file) do io
-        root_name = nothing
-        root_uuid = dummy_uuid(project_file)
-        state = :top
-        for line in eachline(io)
-            if occursin(re_section, line)
-                state === :top && root_name == name && return root_uuid
-                state = occursin(re_section_deps, line) ? :deps : :other
-            elseif state === :top
-                if (m = match(re_name_to_string, line)) !== nothing
-                    root_name = String(m.captures[1])
-                elseif (m = match(re_uuid_to_string, line)) !== nothing
-                    root_uuid = UUID(m.captures[1])
-                end
-            elseif state === :deps
-                if (m = match(re_key_to_string, line)) !== nothing
-                    m.captures[1] == name && return UUID(m.captures[2])
-                end
-            end
-        end
-        return root_name == name ? root_uuid : nothing
+    root_name = nothing
+    root_uuid = dummy_uuid(project_file)
+    d = parsed_toml(project_file)
+    if get(d, "name", nothing) == name
+        return UUID(get(d, "uuid", root_uuid))
+    elseif haskey(d, "deps")
+        deps = d["deps"]
+        uuid = get(deps, name, nothing)
+        uuid === nothing || return UUID(uuid)
     end
-    return pkg_uuid
+    return nothing
 end
 
 # find `where` stanza and return the PkgId for `name`
@@ -521,47 +466,39 @@ end
 function explicit_manifest_deps_get(project_file::String, where::UUID, name::String)::Union{Nothing,PkgId}
     manifest_file = project_file_manifest_path(project_file)
     manifest_file === nothing && return nothing # manifest not found--keep searching LOAD_PATH
-    found_or_uuid = open(manifest_file) do io
-        uuid = deps = nothing
-        state = :other
-        # first search the manifest for the deps section associated with `where` (by uuid)
-        for line in eachline(io)
-            if occursin(re_array_of_tables, line)
-                uuid == where && break
-                uuid = deps = nothing
-                state = :stanza
-            elseif state === :stanza
-                if (m = match(re_uuid_to_string, line)) !== nothing
-                    uuid = UUID(m.captures[1])
-                elseif (m = match(re_deps_to_any, line)) !== nothing
-                    deps = String(m.captures[1])
-                elseif occursin(re_subsection_deps, line)
-                    state = :deps
-                elseif occursin(re_section, line)
-                    state = :other
-                end
-            elseif state === :deps && uuid == where
-                # [deps] section format gives both name and uuid
-                if (m = match(re_key_to_string, line)) !== nothing
-                    m.captures[1] == name && return UUID(m.captures[2])
+    d = parsed_toml(manifest_file)
+    uuid_dep = nothing
+    found_dep = false
+    haskey(d, name) || return nothing
+    for (dep_name, entries) in d
+        for entry in entries
+            haskey(entry, "uuid") || continue
+            if UUID(entry["uuid"]) == where
+                # deps is either a list of names (deps = ["DepA", "DepB"]) or
+                # a table of entries (deps = {"DepA" = "6ea...", "DepB" = "55d..."}
+                deps = get(entry, "deps", nothing)
+                if deps isa Vector
+                    found_dep = name in deps
+                    break
+                elseif deps isa Dict
+                    for (dep, uuid) in deps
+                        if dep === name
+                            uuid_dep = uuid
+                            found_dep = true
+                            break
+                        end
+                    end
                 end
             end
         end
-        # now search through `deps = []` string to see if we have an entry for `name`
-        uuid == where || return false
-        deps === nothing && return true
-        # TODO: handle inline table syntax
-        if deps[1] != '[' || deps[end] != ']'
-            @warn "Unexpected TOML deps format:\n$deps"
-            return false
-        end
-        occursin(repr(name), deps) || return true
-        seekstart(io) # rewind IO handle
-        # finally, find out the `uuid` associated with `name`
-        return something(manifest_file_name_uuid(io, name), false)
     end
-    found_or_uuid isa UUID && return PkgId(found_or_uuid, name)
-    found_or_uuid && return PkgId(name)
+    for entry in d[name]
+        uuid_candidate = get(entry, "uuid", nothing)
+        uuid_candidate === nothing && continue # Warn here??
+        if uuid_dep === nothing || uuid_dep == uuid_candidate
+            return PkgId(UUID(uuid_candidate), name)
+        end
+    end
     return nothing
 end
 
@@ -569,37 +506,28 @@ end
 function explicit_manifest_uuid_path(project_file::String, pkg::PkgId)::Union{Nothing,String}
     manifest_file = project_file_manifest_path(project_file)
     manifest_file === nothing && return nothing # no manifest, skip env
-    open(manifest_file) do io
-        uuid = name = path = hash = nothing
-        for line in eachline(io)
-            if (m = match(re_section_capture, line)) !== nothing
-                uuid == pkg.uuid && break
-                name = String(m.captures[1])
-                path = hash = nothing
-            elseif (m = match(re_uuid_to_string, line)) !== nothing
-                uuid = UUID(m.captures[1])
-            elseif (m = match(re_path_to_string, line)) !== nothing
-                path = String(m.captures[1])
-            elseif (m = match(re_hash_to_string, line)) !== nothing
-                hash = SHA1(m.captures[1])
+
+    d = parsed_toml(manifest_file)
+    entries = get(d, pkg.name, nothing)
+    entries === nothing && return nothing # TODO: allow name to mismatch?
+    for entry in entries
+        if UUID(get(entry, "uuid", nothing)) === pkg.uuid
+            path = get(entry, "path", nothing)
+            if path !== nothing
+                path = normpath(abspath(dirname(manifest_file), path))
+                return path
             end
-        end
-        uuid == pkg.uuid || return nothing
-        name == pkg.name || return nothing # TODO: allow a mismatch?
-        if path !== nothing
-            path = normpath(abspath(dirname(manifest_file), path))
-            return path
-        end
-        hash === nothing && return nothing
-        # Keep the 4 since it used to be the default
-        for slug in (version_slug(uuid, hash, 4), version_slug(uuid, hash))
+            hash = get(entry, "git-tree-sha1", nothing)
+            hash === nothing && return nothing
+            # Keep the 4 since it used to be the default
+            slug = version_slug(pkg.uuid, SHA1(hash))
             for depot in DEPOT_PATH
-                path = abspath(depot, "packages", name, slug)
+                path = abspath(depot, "packages", pkg.name, slug)
                 ispath(path) && return path
             end
         end
-        return nothing
     end
+    return nothing
 end
 
 ## implicit project & manifest API ##
@@ -885,6 +813,7 @@ For more details regarding code loading, see the manual sections on [modules](@r
 [parallel computing](@ref code-availability).
 """
 function require(into::Module, mod::Symbol)
+    empty!(TOML_CACHE)
     uuidkey = identify_package(into, String(mod))
     # Core.println("require($(PkgId(into)), $mod) -> $uuidkey")
     if uuidkey === nothing
